@@ -157,13 +157,226 @@ npx playwright init-agents --loop=vscode   # 또는 claude / codex
 
 매 테스트마다 로그인 폼을 다시 치지 않는다. 서버 입장에서는 그 계정의 진짜 세션을 재사용하는 것이다.
 
+상세 절차·파이프라인 매핑은 아래 **「권한별 실계정 테스트」** 절을 따른다.
+
+---
+
+## 권한별 실계정 테스트 (파이프라인 표준)
+
+권한이 N개면 **그 권한에 맞는 실계정 N개**로 접속해 검증한다.  
+예: 팀원 · 팀장 · 본부장 → 아이디 3개. mock 유저·프론트 숨김만으로 대체하지 않는다.
+
+목표는 “버튼이 안 보이는지”만이 아니라, **그 계정으로 들어갔을 때 서버·메뉴·데이터 범위가 스펙과 같은지**다.
+
+### 전체 흐름
+
+```
+[1] Spec에 역할×허용/거부 규칙을 적는다
+        ↓
+[2] Planner가 role 필드가 있는 시나리오로 쪼갠다
+        ↓
+    env에 역할별 실계정 준비 (CI secret / 로컬 .env)
+        ↓
+    auth.setup: 계정마다 로그인 → .auth/{role}.json
+        ↓
+[3] Generator: project(role) + storageState 기준으로 코드 생성
+        ↓
+[4] Run: Chromium에서 역할 project별로 동일/차별 expect 실행
+        ↓
+[5] Healer: 권한 실패가 APP_BUG면 테스트로 덮지 않음
+        ↓
+[6] CI: setup → member/leader/director project 순(또는 병렬)
+```
+
+### [1] Spec — 권한 규칙을 테스트케이스 원문에 포함
+
+스펙(또는 공통 권한 절)에 역할별 기대를 명시한다. 예:
+
+| 역할 | 허용 | 거부 |
+|------|------|------|
+| 팀원 (member) | 본인 범위 조회 | 승인·전역 지표·타 팀 데이터 |
+| 팀장 (leader) | 팀 범위 조회·승인 | 본부 전역·타 팀 |
+| 본부장 (director) | 상위 메뉴·넓은 조회 | (스펙에 정의된 입력 메뉴만 제한 등) |
+
+성공/실패/예외 문장에 **누가**가 빠져 있으면 Planner가 ASSUMPTION을 남기게 하고, 스펙을 먼저 고친다.
+
+### [2] Planner — 시나리오마다 `role` 필수
+
+권한 E2E는 화면 하나가 아니라 **역할×여정**이다.
+
+```yaml
+id: metrics-menu-member-denied
+title: 팀원은 지표 전용 메뉴에 진입할 수 없다
+priority: P0
+role: member
+route: /tsv-metrics
+steps:
+  - action: 직접 URL 진입 시도
+expects:
+  - access: denied   # 메뉴 없음 또는 가드/리다이렉트
+---
+id: metrics-menu-director-ok
+title: 본부장은 지표 메뉴에 진입할 수 있다
+priority: P0
+role: director
+route: /tsv-metrics
+steps:
+  - action: 메뉴 또는 URL로 진입
+expects:
+  - page: visible
+  - heading_includes: 취급고
+```
+
+규칙:
+
+- 같은 화면이라도 역할마다 **별도 시나리오**(또는 명확한 role 매트릭스)로 둔다.
+- P0만: 메뉴 진입, 핵심 버튼, 데이터 범위 대표 1건. 권한 매트릭스 전체를 E2E로 도배하지 않는다.
+- UI 숨김만 expect하지 말고, 가능하면 **직접 URL 진입**도 한 시나리오에 넣는다.
+
+### 계정 준비 (env) — 파이프라인 공통 전제
+
+역할 수 = 계정 수. staging/전용 E2E 계정을 쓴다. prod 계정 금지.
+
+```bash
+# .env.e2e (gitignored) 또는 CI secrets
+E2E_BASE_URL=https://staging.example.com
+
+E2E_MEMBER_USER=e2e.member
+E2E_MEMBER_PASSWORD=***
+
+E2E_LEADER_USER=e2e.leader
+E2E_LEADER_PASSWORD=***
+
+E2E_DIRECTOR_USER=e2e.director
+E2E_DIRECTOR_PASSWORD=***
+```
+
+| 역할 키 | 파일 | 의미 (프로젝트마다 이름만 맞춰도 됨) |
+|---------|------|--------------------------------------|
+| `member` | `.auth/member.json` | 팀원 |
+| `leader` | `.auth/leader.json` | 팀장 |
+| `director` | `.auth/director.json` | 본부장 |
+
+`.auth/` 는 `.gitignore`. CI는 잡 시작 시 setup이 새로 만든다.
+
+### auth.setup — 아이디로 접속해 세션 덤프 ([4] 직전 필수)
+
+스위트(또는 CI job) 시작 시 **역할마다 1회** 로그인한다.
+
+```
+Chromium
+  → 빈 Context
+  → E2E_MEMBER_USER/PASSWORD 로 /login
+  → 로그인 성공 확인 (홈·메뉴 로드)
+  → storageState 저장 → .auth/member.json
+  → leader / director 동일 반복
+```
+
+주의:
+
+- 로그인 실패·OTP·캡차는 setup 실패로 끊는다. 본 테스트를 빈 세션으로 돌리지 않는다.
+- 토큰 TTL이 짧으면 job마다 setup을 다시 돈다.
+- 계정 비밀번호는 테스트 코드·trace 업로드 설명에 넣지 않는다.
+
+### playwright projects — 역할 = 세션 슬롯
+
+브라우저를 3개 쓰는 게 아니라 **Chromium project 3개**다.
+
+```ts
+// 개념 예시
+projects: [
+  { name: "setup", testMatch: /auth\.setup\.ts/ },
+  {
+    name: "member",
+    dependencies: ["setup"],
+    use: { storageState: ".auth/member.json" },
+  },
+  {
+    name: "leader",
+    dependencies: ["setup"],
+    use: { storageState: ".auth/leader.json" },
+  },
+  {
+    name: "director",
+    dependencies: ["setup"],
+    use: { storageState: ".auth/director.json" },
+  },
+]
+```
+
+Run 시:
+
+```
+npx playwright test --project=member
+npx playwright test --project=leader
+npx playwright test --project=director
+# 또는 전체: setup 후 세 project
+```
+
+같은 `page.goto("/approvals")`라도 project가 다르면 **다른 아이디의 세션**으로 들어가고, expect만 역할에 맞게 갈라진다.
+
+### [3] Generator — 역할 시나리오를 코드로
+
+지시 요지:
+
+- 시나리오의 `role` → 해당 project에서만 실행되게 작성 (`test.describe` + project grep, 또는 파일 분리).
+- 테스트 본문에서 로그인 UI·계정 문자열을 다시 치지 말 것.
+- member 거부 / director 허용처럼 **대칭 시나리오**가 있으면 둘 다 생성.
+
+### [4] Run — 실제로 “그 아이디로” 검증하는 순간
+
+세션 로드 후 동작:
+
+1. Context가 `.auth/{role}.json`의 쿠키·localStorage 주입
+2. 앱이 그 사용자를 인식
+3. 메뉴·API·데이터 범위가 그 권한으로 응답
+4. expect로 스펙과 비교
+
+권한 P0 체크리스트 예:
+
+- [ ] 팀원: 금지 메뉴 없음 + 직접 URL 차단/리다이렉트
+- [ ] 팀장: 팀 범위 목록 보임, 타 팀·전역은 안 보임(또는 스펙대로)
+- [ ] 본부장: 허용 메뉴 진입·조회 성공
+- [ ] (필요 시) 입력 전용 계정은 지표 조회 필드가 안 내려오는지
+
+### [5] Healer — 권한 실패 분류
+
+| 증상 | 분류 | 행동 |
+|------|------|------|
+| 버튼 텍스트·locator만 바뀜 | `UI_CHANGE` | 테스트 수정 |
+| 잘못된 project/storageState 경로 | `TEST_BUG` | 테스트/설정 수정 |
+| 팀원인데 전사 데이터 보임 등 스펙 위반 | `APP_BUG` | **테스트 약화 금지**, 앱 이슈 리포트 |
+| 계정 잠김·로그인 서버 다운 | `ENV_ISSUE` | setup/환경 리포트 |
+
+권한 버그를 “expect를 느슨하게” 고쳐서 초록으로 만들면 파이프라인 위반이다.
+
+### [6] CI — 역할 매트릭스
+
+```
+CI job
+  1) secrets → env
+  2) playwright install chromium
+  3) auth.setup (계정 3 로그인 → .auth/*.json)
+  4) smoke: 역할별 P0만
+  5) nightly: 권한 시나리오 전체 (여전히 Chromium만)
+```
+
+artifact에 `.auth/*.json`을 올리지 않는다. trace만 실패 시 업로드.
+
+### 하지 말 것 (권한)
+
+- 한 계정으로 로그인 후 localStorage만 조작해 역할 흉내
+- 프론트에서 메뉴 숨김만 보고 권한 통과 처리 (URL·API 우회 미검증)
+- 권한 조합 전수 E2E화 (매트릭스는 API/유닛, E2E는 P0 여정)
+- 실계정 비밀번호를 스펙·시나리오 YAML·커밋에 기재
+
 ---
 
 ## 1. Spec 입력 (SDD와 연결) — 상세는 위 [1]
 
 입력·보일러플레이트·성공/실패/예외의 의미는 **파이프라인 개요 → [1]** 을 따른다.  
 Generator로 바로 가지 말고 Planner([2])로 내린다.
-
+권한 규칙은 **「권한별 실계정 테스트」** 절과 함께 스펙에 적어 둔다.
 ---
 
 ## 2. Planner → 시나리오 명세
